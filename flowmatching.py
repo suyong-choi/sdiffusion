@@ -22,7 +22,7 @@ plt.close('all')
 # ===================================================================
 class Config:
     """ Stores model and training configuration parameters for Flow Matching. """
-    def __init__(self, M, nhidden, nlayers, batch_size, learning_rate, epochs, time_embed_dim=64, ode_steps=50, epsilon=1e-5):
+    def __init__(self, M, nhidden, nlayers, batch_size, learning_rate, epochs, time_embed_dim=64, ode_steps=50, epsilon=1e-5, conditional=False, conditional_dim=0):
         self.M = M # Data dimensionality
         self.nhidden = nhidden # Hidden layer size
         self.nlayers = nlayers # Number of layers in MLP
@@ -33,6 +33,8 @@ class Config:
         self.time_embed_dim = time_embed_dim # Dimension for time embedding MLP
         self.ode_steps = ode_steps # Number of steps for ODE solver during sampling
         self.epsilon = epsilon # Small value to avoid t=0 during training path sampling
+        self.conditional = conditional # Flag for conditional training
+        self.conditional_dim = conditional_dim # Dimension of conditional variable
 
         # --- Device and AMP setup ---
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -67,9 +69,11 @@ class PositionalEmbedding(nn.Module):
 
 class VelocityMLP(nn.Module):
     """ MLP model representing the velocity field v(x, t). """
-    def __init__(self, M, nhidden, nlayers, time_embed_dim):
+    def __init__(self, M, nhidden, nlayers, time_embed_dim, conditional=False, conditional_dim=0):
         super().__init__()
         self.time_embed_dim = time_embed_dim
+        self.conditional = conditional
+        self.conditional_dim = conditional_dim
 
         # Time embedding layer (can be MLP or sinusoidal)
         # Using sinusoidal for simplicity here
@@ -81,15 +85,25 @@ class VelocityMLP(nn.Module):
          )
         # Using Mingrustack as the core network
         # Input dimension is M (data) + time_embed_dim
-        self.core_model = Mingrustack(nlayers, M + time_embed_dim, nhidden, M) # Output dim is M (velocity)
-        print(f"Initialized VelocityMLP with {nlayers} layers, hidden size {nhidden}, time_embed_dim {time_embed_dim}")
+        core_input_dim = M + time_embed_dim
+        if conditional:
+            core_input_dim += conditional_dim
+        self.core_model = Mingrustack(nlayers, core_input_dim, nhidden, M) # Output dim is M (velocity)
+        print(f"Initialized VelocityMLP with {nlayers} layers, hidden size {nhidden}, time_embed_dim {time_embed_dim}, conditional {conditional}, conditional_dim {conditional_dim}")
 
-    def forward(self, x, t):
+    def forward(self, x, t, c=None):
         # x shape: [batch_size, M]
         # t shape: [batch_size]
         t_emb = self.time_embed(t) # Shape: [batch_size, time_embed_dim]
         # Concatenate data and time embedding
         xt_emb = torch.cat([x, t_emb], dim=1) # Shape: [batch_size, M + time_embed_dim]
+
+        # Concatenate conditional variable if present
+        if self.conditional:
+            if c is None:
+                raise ValueError("Conditional variable 'c' must be provided when conditional=True")
+            xt_emb = torch.cat([xt_emb, c], dim=1) # Shape: [batch_size, M + time_embed_dim + conditional_dim]
+
         # Predict velocity
         velocity = self.core_model(xt_emb) # Shape: [batch_size, M]
         return velocity
@@ -117,7 +131,7 @@ def load_model(model_class, config, filename="model_fm.pth"): # Changed default 
     filepath = os.path.join(directory, filename)
     # Instantiate model first on the correct device
     # Use VelocityMLP or the specific class used for training
-    model = model_class(config.M, config.nhidden, config.nlayers, config.time_embed_dim).to(config.device)
+    model = model_class(config.M, config.nhidden, config.nlayers, config.time_embed_dim, config.conditional, config.conditional_dim).to(config.device)
     if os.path.exists(filepath):
         try:
             model.load_state_dict(torch.load(filepath, map_location=config.device))
@@ -151,11 +165,28 @@ def get_config_description(config):
 # ===================================================================
 # Sampling Function (Flow Matching using ODE Solver)
 # ===================================================================
-def sample_flow(v_net, config, num_samples=1):
-    """ Generates samples using the learned velocity field and an ODE solver. """
-    v_net.eval() # Set model to evaluation mode
+def sample_flow(v_net, config, num_samples=1, conditional_data=None):
+    """Generates samples using the learned velocity field and an ODE solver,
+    conditioned on provided conditional data.
+"""
+    v_net.eval()  # Set model to evaluation mode
     device = config.device
     M = config.M
+
+    if config.conditional:
+        if conditional_data is None:
+            raise ValueError(
+                "Conditional data must be provided when config.conditional is True"
+            )
+        if conditional_data.shape[0] != num_samples:
+            raise ValueError(
+                "Number of conditional data points must match num_samples"
+            )
+        if conditional_data.shape[1] != config.conditional_dim:
+            raise ValueError(
+                "Dimension of conditional data must match config.conditional_dim"
+            )
+        conditional_data = conditional_data.to(device)
 
     # Define the dynamics function for the ODE solver
     # Needs access to the velocity network (v_net)
@@ -166,16 +197,20 @@ def sample_flow(v_net, config, num_samples=1):
         with torch.no_grad(): # Ensure no gradients are computed here
              # Use autocast if AMP was used during training, might improve inference speed
              with amp.autocast(enabled=config.use_amp):
-                  velocity = v_net(x, t_tensor)
+                  # Pass conditional variable to the network if needed
+                  if config.conditional:
+                        velocity = v_net(x, t_tensor, c=conditional_data)
+                  else:
+                        velocity = v_net(x, t_tensor)
         return velocity
 
-    with torch.no_grad(): # Overall no_grad context
+    with torch.no_grad():  # Overall no_grad context
         # Sample initial points from the prior (standard Gaussian)
         x0 = torch.randn(num_samples, M, device=device)
 
         # Define the time steps for integration (from 0 to 1)
         # More steps generally lead to better accuracy but slower sampling
-        t_eval = torch.linspace(0., 1., config.ode_steps, device=device)
+        t_eval = torch.linspace(0.0, 1.0, config.ode_steps, device=device)
 
         print(f"Starting ODE integration with {config.ode_steps} steps...")
         # Use the ODE solver (e.g., 'dopri5', 'rk4')
@@ -207,6 +242,9 @@ def train_flow_matching(data, config):
     Trains a Flow Matching model (velocity network).
     Assumes 'data' tensor is already on the target device (GPU-resident).
     Displays epoch-level tqdm progress.
+    Data is expected to have the shape [num_samples, M + conditional_dim],
+    where the first M columns are the features and the remaining
+    conditional_dim columns are the conditional variables.
     """
     device = config.device
     use_amp = config.use_amp
@@ -214,30 +252,59 @@ def train_flow_matching(data, config):
 
     print(f"Training Flow Matching model with data on device: {data.device}")
 
-    if data.device.type != device.type:
+    if config.conditional:
+        if data.shape[1] != config.M + config.conditional_dim:
+            raise ValueError(
+                "Data dimension must be M + conditional_dim when config.conditional is True"
+            )
+
+        # Extract conditional data from the last 'conditional_dim' columns
+        conditional_data = data[:, config.M :]
+        if conditional_data.device.type != device.type:
+            conditional_data = conditional_data.to(device)
+        # Extract feature data from the first M columns
+        feature_data = data[:, : config.M]
+        if feature_data.device != device:
+            feature_data = feature_data.to(device)
+    else:
+        feature_data = data
+        conditional_data = None
+
+    if feature_data.device.type != device.type:
         # This catches mismatches like data on CPU when target is GPU, or vice-versa
-        print(f"Error: Data device type ('{data.device.type}') differs from target device type ('{device.type}').")
-        return None, [] # Return indicating failure
-    elif device.type == 'cuda':
+        print( f"Error: Data device type ('{feature_data.device.type}') differs from target device type ('{device.type}').")
+        return None, []  # Return indicating failure
+    elif device.type == "cuda":
         # Optional: Add a check if a specific non-zero GPU index was requested in config
         # and the data ended up elsewhere. Usually not necessary if using default device.
         # if device.index is not None and device.index != data_device.index:
         #    print(f"Error: Data device index ({data_device.index}) differs from target device index ({device.index}).")
         #    return None, []
-        pass # Types match (both cuda or both cpu), proceed.
+        pass  # Types match (both cuda or both cpu), proceed.
 
     # Create DataLoader for GPU Tensor
     try:
-        dataset = TensorDataset(data)
+        if config.conditional:
+            # Create DataLoader for feature data only (conditional data is not used in DataLoader)
+            dataset = TensorDataset(feature_data, conditional_data)
+        else:
+            dataset = TensorDataset(feature_data)
         dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True,
                                 num_workers=0, pin_memory=False, drop_last=True)
-        print(f"DataLoader created with batch size {config.batch_size}, num_workers=0, pin_memory=False")
+        print( f"DataLoader created with batch size {config.batch_size}, num_workers=0, pin_memory=False")
     except Exception as e:
         print(f"Error creating DataLoader: {e}")
         return None, []
 
     # Initialize the velocity network model
-    v_net = VelocityMLP(config.M, config.nhidden, config.nlayers, config.time_embed_dim).to(device)
+    v_net = VelocityMLP(
+        config.M,
+        config.nhidden,
+        config.nlayers,
+        config.time_embed_dim,
+        config.conditional,
+        config.conditional_dim,
+    ).to(device)
 
     try:
         optimizer = optim.Adam(v_net.parameters(), lr=config.learning_rate)
@@ -260,14 +327,21 @@ def train_flow_matching(data, config):
 
         # Iterate through batches (data points x_1, already on GPU)
         for batch in dataloader:
-            x_1 = batch[0] # Target data points
+            x_1 = batch[0] # Target data points (feature data only)
             current_batch_size = x_1.shape[0]
 
             # 1. Sample time t ~ U(epsilon, 1)
             t = torch.rand(current_batch_size, device=device) * (1.0 - epsilon) + epsilon
 
             # 2. Sample prior points x_0 ~ N(0, I)
-            x_0 = torch.randn_like(x_1) # Same shape and device as x_1
+            x_0 = torch.randn_like(x_1)  # Same shape and device as x_1
+
+            # 2.5 Use conditional variable from data
+            if config.conditional:
+                # Get the corresponding conditional data batch
+                c = batch[1]
+            else:
+                c = None
 
             # 3. Calculate points on the OT path: x_t = t*x_1 + (1-t)*x_0
             # Need to reshape t for broadcasting: [batch_size, 1]
@@ -280,7 +354,7 @@ def train_flow_matching(data, config):
             # --- Mixed Precision Context (forward pass) ---
             with amp.autocast(enabled=use_amp):
                 # Predict velocity using the network
-                predicted_velocity = v_net(x_t, t)
+                predicted_velocity = v_net(x_t, t, c=c)
                 # Calculate loss between predicted and target velocity
                 loss = criterion(predicted_velocity, v_target)
 
@@ -302,7 +376,7 @@ def train_flow_matching(data, config):
              epochs_pbar.set_postfix(avg_loss=f"{avg_epoch_loss:.6f}")
         else:
              print(f"Warning: DataLoader was empty for epoch {epoch+1}.")
-             epoch_losses.append(float('nan'))
+             epoch_losses.append(float("nan"))
 
     print("\nTraining finished.")
     return v_net, epoch_losses
@@ -329,7 +403,9 @@ if __name__ == "__main__":
         epochs=10000,         # Number of training epochs
         time_embed_dim=64, # Dimension for time embedding
         ode_steps=50,       # Number of steps for sampling ODE solver
-        epsilon=1e-5        # Small offset for time sampling
+        epsilon=1e-5,        # Small offset for time sampling
+        conditional=False,   # Enable conditional training
+        conditional_dim=16    # Dimension of conditional variable
     )
 
     # 3. Move Entire Dataset to Target Device (GPU if available)
