@@ -13,7 +13,7 @@ import torch.cuda.amp as amp
 import torch.nn.functional as F # For F.pad
 from torchdiffeq import odeint # Import the ODE solver
 from mingruinspired import Mingrustack  # Assuming this is your custom module
-from utils import generate_3d_sphere_data, normalize_data, denormalize_data # Assume utils exists
+from utils import generate_3d_sphere_data, DynamicMLP
 
 # --- Optional: Clear plots at the start ---
 plt.close('all')
@@ -89,6 +89,7 @@ class VelocityMLP(nn.Module):
         if conditional:
             core_input_dim += conditional_dim
         self.core_model = Mingrustack(nlayers, core_input_dim, nhidden, M) # Output dim is M (velocity)
+        #self.core_model = DynamicMLP(core_input_dim, nhidden, nlayers, M) # Output dim is M (velocity)
         print(f"Initialized VelocityMLP with {nlayers} layers, hidden size {nhidden}, time_embed_dim {time_embed_dim}, conditional {conditional}, conditional_dim {conditional_dim}")
 
     def forward(self, x, t, c=None):
@@ -165,7 +166,7 @@ def get_config_description(config):
 # ===================================================================
 # Sampling Function (Flow Matching using ODE Solver)
 # ===================================================================
-def sample_flow(v_net, config, num_samples=1, conditional_data=None):
+def sample_flow(v_net, config, num_samples=1, conditional_data=None, srcdist=None):
     """Generates samples using the learned velocity field and an ODE solver,
     conditioned on provided conditional data.
 """
@@ -206,7 +207,11 @@ def sample_flow(v_net, config, num_samples=1, conditional_data=None):
 
     with torch.no_grad():  # Overall no_grad context
         # Sample initial points from the prior (standard Gaussian)
-        x0 = torch.randn(num_samples, M, device=device)
+        if srcdist is None:
+            x0 = torch.randn(num_samples, M, device=device)
+        else:
+            sampleidx = torch.randperm(num_samples) 
+            x0 = srcdist[sampleidx]
 
         # Define the time steps for integration (from 0 to 1)
         # More steps generally lead to better accuracy but slower sampling
@@ -237,7 +242,7 @@ def sample_flow(v_net, config, num_samples=1, conditional_data=None):
 # ===================================================================
 # Training Function (Flow Matching)
 # ===================================================================
-def train_flow_matching(data, config):
+def train_flow_matching(data, config, srcdist=None):
     """
     Trains a Flow Matching model (velocity network).
     Assumes 'data' tensor is already on the target device (GPU-resident).
@@ -282,6 +287,9 @@ def train_flow_matching(data, config):
         #    return None, []
         pass  # Types match (both cuda or both cpu), proceed.
 
+    if srcdist is None:
+        srcdist = torch.randn_like(feature_data, device=device)  # Placeholder for source distribution
+
     # Create DataLoader for GPU Tensor
     try:
         if config.conditional:
@@ -292,6 +300,9 @@ def train_flow_matching(data, config):
         dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True,
                                 num_workers=0, pin_memory=False, drop_last=True)
         print( f"DataLoader created with batch size {config.batch_size}, num_workers=0, pin_memory=False")
+        srcdataloader = DataLoader(srcdist, batch_size=config.batch_size, shuffle=True,
+                                num_workers=0, pin_memory=False, drop_last=True)
+        print( f"Src dataLoader created with batch size {config.batch_size}, num_workers=0, pin_memory=False")
     except Exception as e:
         print(f"Error creating DataLoader: {e}")
         return None, []
@@ -326,7 +337,7 @@ def train_flow_matching(data, config):
         epoch_loss = 0.0
 
         # Iterate through batches (data points x_1, already on GPU)
-        for batch in dataloader:
+        for batch, srcbatch in zip(dataloader, srcdataloader):
             x_1 = batch[0] # Target data points (feature data only)
             current_batch_size = x_1.shape[0]
 
@@ -334,7 +345,8 @@ def train_flow_matching(data, config):
             t = torch.rand(current_batch_size, device=device) * (1.0 - epsilon) + epsilon
 
             # 2. Sample prior points x_0 ~ N(0, I)
-            x_0 = torch.randn_like(x_1)  # Same shape and device as x_1
+            #x_0 = torch.randn_like(x_1)  # Same shape and device as x_1
+            x_0 = srcbatch # Source data points (feature data only)
 
             # 2.5 Use conditional variable from data
             if config.conditional:
