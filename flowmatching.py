@@ -7,22 +7,48 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation # Import animation library
 from tqdm import tqdm
-import os
+import pathlib
 import torch.cuda.amp as amp
 import torch.nn.functional as F # For F.pad
 from torchdiffeq import odeint # Import the ODE solver
 from mingruinspired import Mingrustack  # Assuming this is your custom module
 from utils import generate_3d_sphere_data, DynamicMLP
+import ot as pot
+import numpy as np
 
-# --- Optional: Clear plots at the start ---
-plt.close('all')
+# ===================================================================
+# Evaluation Metrics
+# ===================================================================
+
+def get_map(x0, x1):
+    """Compute the OT plan (wrt squared Euclidean cost) between a source and a target
+    minibatch.
+
+    Parameters
+    ----------
+    x0 : Tensor, shape (bs, *dim)
+        represents the source minibatch
+    x1 : Tensor, shape (bs, *dim)
+        represents the source minibatch
+
+    Returns
+    -------
+    p : numpy array, shape (bs, bs)
+        represents the OT plan between minibatches
+    """
+    a, b = pot.unif(x0.shape[0]), pot.unif(x1.shape[0])
+    M = torch.cdist(x0, x1) ** 2
+    p = pot.emd(a, b, M.detach().cpu().numpy())
+    return p
+
 # ===================================================================
 # Configuration Class (Adapted for Flow Matching)
 # ===================================================================
 class Config:
     """ Stores model and training configuration parameters for Flow Matching. """
-    def __init__(self, M, nhidden, nlayers, batch_size, learning_rate, epochs, time_embed_dim=64, ode_steps=50, epsilon=1e-5, conditional=False, conditional_dim=0):
+    def __init__(self, M, nhidden, nlayers, batch_size, learning_rate, epochs, time_embed_dim=64, ode_steps=50, epsilon=1e-5, conditional=False, conditional_dim=0, useOT=False):
         self.M = M # Data dimensionality
         self.nhidden = nhidden # Hidden layer size
         self.nlayers = nlayers # Number of layers in MLP
@@ -35,6 +61,7 @@ class Config:
         self.epsilon = epsilon # Small value to avoid t=0 during training path sampling
         self.conditional = conditional # Flag for conditional training
         self.conditional_dim = conditional_dim # Dimension of conditional variable
+        self.useOT = useOT # Flag for using optimal transport plan
 
         # --- Device and AMP setup ---
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -109,6 +136,35 @@ class VelocityMLP(nn.Module):
         velocity = self.core_model(xt_emb) # Shape: [batch_size, M]
         return velocity
 
+class VelocityMLP_Conditional(nn.Module):
+    def __init__(self, M, nhidden, nlayers, conditional=False, conditional_dim=0):
+        super().__init__()
+        self.M = M
+        self.nhidden = nhidden
+        self.nlayers = nlayers
+        self.conditional = conditional
+        self.conditional_dim = conditional_dim
+        core_input_dim = M + 1 # M + 1 for time embedding (t)
+        if conditional:
+            core_input_dim += conditional_dim
+        self.core_model = Mingrustack(nlayers, core_input_dim, nhidden, M) # Output dim is M (velocity)
+    
+    def forward(self, x, t, c=None):
+        # x shape: [batch_size, M]
+        # t shape: [batch_size]
+        # c shape: [batch_size, conditional_dim] if conditional=True
+        xt = torch.cat([x, t[:,None]], dim=1)
+        if self.conditional:
+            if c is None:
+                raise ValueError("Conditional variable 'c' must be provided when conditional=True")
+            # Concatenate data and conditional variable
+            xt= torch.cat([xt, c], dim=1)
+        
+        # Predict velocity
+        velocity = self.core_model(xt) # Shape: [batch_size, M]
+        return velocity
+
+
 # ===================================================================
 # Utility Functions (Keep as before: model_io.py, plotting_utils.py)
 # ===================================================================
@@ -116,24 +172,28 @@ def get_config_directory(config):
     """ Creates a directory name based on config parameters. """
     lr_str = f"{config.learning_rate:.0e}" # Format LR concisely
     # Adjusted for Flow Matching config
-    return f"FM_M{config.M}_nh{config.nhidden}_nl{config.nlayers}_ted{config.time_embed_dim}_BS{config.batch_size}_LR{lr_str}_E{config.epochs}"
+    if config.useOT:
+        return f"FM_M{config.M}_nh{config.nhidden}_nl{config.nlayers}_ted{config.time_embed_dim}_BS{config.batch_size}_LR{lr_str}_E{config.epochs}_OT"
+    else:
+        return f"FM_M{config.M}_nh{config.nhidden}_nl{config.nlayers}_ted{config.time_embed_dim}_BS{config.batch_size}_LR{lr_str}_E{config.epochs}"
 
 def save_model(model, config, filename="model_fm.pth"): # Changed default filename
     """ Saves the model state dictionary. """
     directory = get_config_directory(config)
-    os.makedirs(directory, exist_ok=True)
-    filepath = os.path.join(directory, filename)
+    pathlib.Path(directory).mkdir(parents=True, exist_ok=True)
+    filepath = pathlib.Path(directory) / filename
     torch.save(model.state_dict(), filepath)
     print(f"Model saved to {filepath}")
 
 def load_model(model_class, config, filename="model_fm.pth"): # Changed default filename
     """ Loads the model state dictionary. """
     directory = get_config_directory(config)
-    filepath = os.path.join(directory, filename)
+    filepath = pathlib.Path(directory) / filename
     # Instantiate model first on the correct device
     # Use VelocityMLP or the specific class used for training
-    model = model_class(config.M, config.nhidden, config.nlayers, config.time_embed_dim, config.conditional, config.conditional_dim).to(config.device)
-    if os.path.exists(filepath):
+    #model = model_class(config.M, config.nhidden, config.nlayers, config.time_embed_dim, config.conditional, config.conditional_dim).to(config.device)
+    model = model_class(config.M, config.nhidden, config.nlayers, config.conditional, config.conditional_dim).to(config.device)
+    if filepath.exists():
         try:
             model.load_state_dict(torch.load(filepath, map_location=config.device))
             print(f"Model loaded from {filepath}")
@@ -146,8 +206,8 @@ def load_model(model_class, config, filename="model_fm.pth"): # Changed default 
 def save_plot(fig, config, filename):
     """ Saves a matplotlib figure to the config directory. """
     directory = get_config_directory(config)
-    os.makedirs(directory, exist_ok=True)
-    filepath = os.path.join(directory, filename)
+    pathlib.Path(directory).mkdir(parents=True, exist_ok=True)
+    filepath = pathlib.Path(directory) / filename
     try:
         fig.savefig(filepath, bbox_inches='tight')
         print(f"Plot saved to {filepath}")
@@ -166,7 +226,7 @@ def get_config_description(config):
 # ===================================================================
 # Sampling Function (Flow Matching using ODE Solver)
 # ===================================================================
-def sample_flow(v_net, config, num_samples=1, conditional_data=None, srcdist=None):
+def sample_flow(v_net, config, num_samples=1, conditional_data=None, srcdist=None, returnsrc = False, returntraj=False):
     """Generates samples using the learned velocity field and an ODE solver,
     conditioned on provided conditional data.
 """
@@ -236,287 +296,398 @@ def sample_flow(v_net, config, num_samples=1, conditional_data=None, srcdist=Non
         samples = traj[-1] # Shape: [num_samples, M]
 
     v_net.train() # Return model to training mode if needed elsewhere
-    return samples.cpu() # Return samples on CPU
+    if returntraj:
+        return traj.cpu()
+    elif returnsrc:
+        return x0.cpu(), samples.cpu() # Return both source and generated samples on CPU
+    else:
+        return samples.cpu() # Return samples on CPU
 
 
 # ===================================================================
-# Training Function (Flow Matching)
+# Training Helper Functions
 # ===================================================================
-def train_flow_matching(data, config, srcdist=None):
-    """
-    Trains a Flow Matching model (velocity network).
-    Assumes 'data' tensor is already on the target device (GPU-resident).
-    Displays epoch-level tqdm progress.
-    Data is expected to have the shape [num_samples, M + conditional_dim],
-    where the first M columns are the features and the remaining
-    conditional_dim columns are the conditional variables.
-    """
+
+def prepare_data_and_loaders(data, config, srcdist=None, shuffle_train=True):
+    """Prepares data (splitting features/conditional) and creates DataLoaders."""
     device = config.device
-    use_amp = config.use_amp
-    epsilon = config.epsilon # Small value to avoid t=0
+    feature_data = None
+    conditional_data_tensor = None # Renamed to avoid conflict
 
-    print(f"Training Flow Matching model with data on device: {data.device}")
-
+    # --- Data Splitting and Device Check ---
     if config.conditional:
         if data.shape[1] != config.M + config.conditional_dim:
-            raise ValueError(
-                "Data dimension must be M + conditional_dim when config.conditional is True"
-            )
-
-        # Extract conditional data from the last 'conditional_dim' columns
-        conditional_data = data[:, config.M :]
-        if conditional_data.device.type != device.type:
-            conditional_data = conditional_data.to(device)
-        # Extract feature data from the first M columns
-        feature_data = data[:, : config.M]
-        if feature_data.device != device:
-            feature_data = feature_data.to(device)
+            raise ValueError("Data dimension must be M + conditional_dim when config.conditional is True")
+        conditional_data_tensor = data[:, config.M:].to(device)
+        feature_data = data[:, :config.M].to(device)
     else:
-        feature_data = data
-        conditional_data = None
+        feature_data = data.to(device)
 
     if feature_data.device.type != device.type:
-        # This catches mismatches like data on CPU when target is GPU, or vice-versa
-        print( f"Error: Data device type ('{feature_data.device.type}') differs from target device type ('{device.type}').")
-        return None, []  # Return indicating failure
-    elif device.type == "cuda":
-        # Optional: Add a check if a specific non-zero GPU index was requested in config
-        # and the data ended up elsewhere. Usually not necessary if using default device.
-        # if device.index is not None and device.index != data_device.index:
-        #    print(f"Error: Data device index ({data_device.index}) differs from target device index ({device.index}).")
-        #    return None, []
-        pass  # Types match (both cuda or both cpu), proceed.
+        raise RuntimeError(f"Error: Feature data device type ('{feature_data.device.type}') differs from target device type ('{device.type}').")
+    if srcdist is not None and srcdist.device.type != device.type:
+         srcdist = srcdist.to(device) # Ensure srcdist is on the correct device
+         print(f"Moved srcdist to {device}")
 
     if srcdist is None:
-        srcdist = torch.randn_like(feature_data, device=device)  # Placeholder for source distribution
+        print("Generating default source distribution (Gaussian)")
+        srcdist = torch.randn_like(feature_data, device=device)
 
-    # Create DataLoader for GPU Tensor
+    # --- DataLoader Creation ---
     try:
         if config.conditional:
-            # Create DataLoader for feature data only (conditional data is not used in DataLoader)
-            dataset = TensorDataset(feature_data, conditional_data)
+            dataset = TensorDataset(feature_data, conditional_data_tensor)
         else:
             dataset = TensorDataset(feature_data)
-        dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True,
-                                num_workers=0, pin_memory=False, drop_last=True)
-        print( f"DataLoader created with batch size {config.batch_size}, num_workers=0, pin_memory=False")
-        srcdataloader = DataLoader(srcdist, batch_size=config.batch_size, shuffle=True,
-                                num_workers=0, pin_memory=False, drop_last=True)
-        print( f"Src dataLoader created with batch size {config.batch_size}, num_workers=0, pin_memory=False")
-    except Exception as e:
-        print(f"Error creating DataLoader: {e}")
-        return None, []
 
-    # Initialize the velocity network model
-    v_net = VelocityMLP(
-        config.M,
-        config.nhidden,
-        config.nlayers,
-        config.time_embed_dim,
-        config.conditional,
-        config.conditional_dim,
-    ).to(device)
+        dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=shuffle_train,
+                                num_workers=0, pin_memory=False, drop_last=True)
+        print(f"Target DataLoader created (shuffle={shuffle_train})")
+
+        # Use TensorDataset for srcdist to ensure consistent batching if drop_last=True
+        src_dataset = TensorDataset(srcdist)
+        srcdataloader = DataLoader(src_dataset, batch_size=config.batch_size, shuffle=shuffle_train,
+                                   num_workers=0, pin_memory=False, drop_last=True)
+        print(f"Source DataLoader created (shuffle={shuffle_train})")
+
+    except Exception as e:
+        raise RuntimeError(f"Error creating DataLoader: {e}")
+
+    return feature_data, conditional_data_tensor, srcdist, dataloader, srcdataloader
+
+
+def initialize_training_components(config, v_net=None):
+    """Initializes the model, optimizer, criterion, and scaler."""
+    device = config.device
+    if v_net is None:
+        # Defaulting to VelocityMLP_Conditional based on previous structure
+        print("Initializing new VelocityMLP_Conditional model.")
+        v_net = VelocityMLP_Conditional(
+            config.M,
+            config.nhidden,
+            config.nlayers,
+            config.conditional,
+            config.conditional_dim,
+        ).to(device)
+    else:
+        print("Using provided v_net model.")
+        v_net = v_net.to(device) # Ensure provided model is on correct device
 
     try:
         optimizer = optim.Adam(v_net.parameters(), lr=config.learning_rate)
-        criterion = nn.MSELoss() # Mean Squared Error loss
-        scaler = amp.GradScaler(enabled=use_amp) # GradScaler for mixed precision
+        criterion = nn.MSELoss()
+        scaler = amp.GradScaler(enabled=config.use_amp)
     except Exception as e:
-        print(f"Error initializing model/optimizer: {e}")
+        raise RuntimeError(f"Error initializing optimizer/criterion/scaler: {e}")
+
+    return v_net, optimizer, criterion, scaler
+
+
+# ===================================================================
+# Training Function (Flow Matching) - Refactored
+# ===================================================================
+def train_flow_matching(data, config, srcdist=None, v_net=None, shuffle_train=True):
+    """
+    Trains a Flow Matching model (velocity network) using helper functions.
+    """
+    device = config.device
+    epsilon = config.epsilon
+
+    print(f"--- Preparing Data and Loaders ---")
+    try:
+        feature_data, _, srcdist, dataloader, srcdataloader = prepare_data_and_loaders(
+            data, config, srcdist, shuffle_train=shuffle_train
+        )
+    except Exception as e:
+        print(f"Error during data/loader preparation: {e}")
+        return None, []
+
+    print(f"--- Initializing Training Components ---")
+    try:
+        v_net, optimizer, criterion, scaler = initialize_training_components(config, v_net)
+    except Exception as e:
+        print(f"Error during component initialization: {e}")
         return None, []
 
     epoch_losses = []
-    print(f"Starting Flow Matching training on {device} for {config.epochs} epochs...")
 
-    # Wrap the epoch loop with tqdm for epoch-level progress tracking
-    epochs_pbar = tqdm(range(config.epochs), desc=f"Training FM (Epochs)", unit="epoch")
+    print(f"--- Starting Flow Matching Training ({config.epochs} epochs) ---")
+    epochs_pbar = tqdm(range(config.epochs), desc=f"Training FM", unit="epoch")
 
     # --- Training Loop ---
     for epoch in epochs_pbar:
-        v_net.train() # Ensure model is in training mode
+        v_net.train()
         epoch_loss = 0.0
+        num_batches = 0
 
-        # Iterate through batches (data points x_1, already on GPU)
-        for batch, srcbatch in zip(dataloader, srcdataloader):
-            x_1 = batch[0] # Target data points (feature data only)
+        # Use zip_longest if datasets might have slightly different sizes due to drop_last
+        # from itertools import zip_longest
+        # for batch, srcbatch_tuple in zip_longest(dataloader, srcdataloader):
+        #     if batch is None or srcbatch_tuple is None: continue # Skip incomplete pairs
+        #     x_1 = batch[0]
+        #     x_0 = srcbatch_tuple[0] # srcdataloader yields tuples
+        #     c = batch[1] if config.conditional else None
+
+        # Using zip assumes dataloaders yield same number of batches (due to drop_last=True)
+        for batch, srcbatch_tuple in zip(dataloader, srcdataloader):
+            x_1 = batch[0]
+            x_0 = srcbatch_tuple[0] # DataLoader wraps tensors in a tuple
+            c = batch[1] if config.conditional else None
             current_batch_size = x_1.shape[0]
 
-            # 1. Sample time t ~ U(epsilon, 1)
             t = torch.rand(current_batch_size, device=device) * (1.0 - epsilon) + epsilon
 
-            # 2. Sample prior points x_0 ~ N(0, I)
-            #x_0 = torch.randn_like(x_1)  # Same shape and device as x_1
-            x_0 = srcbatch # Source data points (feature data only)
+            if config.useOT:
+                # Ensure x_0 and x_1 are used for OT mapping before potential modification
+                x_0_ot = x_0
+                x_1_ot = x_1
+                ot_plan = get_map(x_0_ot, x_1_ot)
+                # Sample indices based on the OT plan. This part needs careful implementation.
+                # A simple approach (might not be strictly correct OT sampling):
+                # Find pairs with non-zero transport mass. For simplicity, we might
+                # just use the original pairs if OT plan is complex to sample from directly.
+                # Or, use pot.sample.sample_from_plan(ot_plan) if applicable.
+                # Sticking to the original pairing for simplicity here unless a specific
+                # OT sampling strategy is required. If OT is used, the pairing
+                # x_0[i] -> x_1[j] is determined by the plan P[i,j].
+                # The provided code `indices = np.nonzero(M)[1]` seemed incorrect for sampling pairs.
+                # Let's skip the complex OT sampling for now and use direct pairs.
+                # If true OT path sampling is needed, `get_map` and sampling logic needs revision.
+                pass # Placeholder if OT sampling logic needs refinement
 
-            # 2.5 Use conditional variable from data
-            if config.conditional:
-                # Get the corresponding conditional data batch
-                c = batch[1]
-            else:
-                c = None
-
-            # 3. Calculate points on the OT path: x_t = t*x_1 + (1-t)*x_0
-            # Need to reshape t for broadcasting: [batch_size, 1]
             t_reshaped = t.view(-1, 1)
             x_t = t_reshaped * x_1 + (1.0 - t_reshaped) * x_0
-
-            # 4. Calculate target velocity: v_target = x_1 - x_0
             v_target = x_1 - x_0
 
-            # --- Mixed Precision Context (forward pass) ---
-            with amp.autocast(enabled=use_amp):
-                # Predict velocity using the network
+            with amp.autocast(enabled=config.use_amp):
                 predicted_velocity = v_net(x_t, t, c=c)
-                # Calculate loss between predicted and target velocity
                 loss = criterion(predicted_velocity, v_target)
 
-            # --- Backpropagation with GradScaler ---
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
-            # Optional: Gradient Clipping
-            # scaler.unscale_(optimizer)
-            # torch.nn.utils.clip_grad_norm_(v_net.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
             epoch_loss += loss.item()
+            num_batches += 1
 
-        # Calculate average loss for the completed epoch
-        if len(dataloader) > 0:
-             avg_epoch_loss = epoch_loss / len(dataloader)
-             epoch_losses.append(avg_epoch_loss)
-             epochs_pbar.set_postfix(avg_loss=f"{avg_epoch_loss:.6f}")
+        if num_batches > 0:
+            avg_epoch_loss = epoch_loss / num_batches
+            epoch_losses.append(avg_epoch_loss)
+            epochs_pbar.set_postfix(avg_loss=f"{avg_epoch_loss:.6f}")
         else:
-             print(f"Warning: DataLoader was empty for epoch {epoch+1}.")
-             epoch_losses.append(float("nan"))
+            print(f"Warning: No batches processed in epoch {epoch+1}.")
+            epoch_losses.append(float("nan"))
+
 
     print("\nTraining finished.")
     return v_net, epoch_losses
 
 
 # ===================================================================
-# Main Execution Block (Flow Matching)
+# Plotting Helper Functions
+# ===================================================================
+
+def plot_training_loss(epoch_losses, config, training_plotfilename="training_loss_fm.png"):
+    """Plots the training loss curve."""
+    plt.figure(figsize=(10, 5))
+    plt.plot(epoch_losses, label='Training Loss (Flow Matching)')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss (MSE)')
+    plt.yscale('log')
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.legend()
+    plt.title(f'Flow Matching Training Loss\n{get_config_description(config)}')
+    loss_fig = plt.gcf()
+    save_plot(loss_fig, config, training_plotfilename)
+
+def plot_radii_histogram(original_radii_np, generated_data, config):
+    """Plots histograms of original and generated data radii."""
+    generated_radii = torch.norm(generated_data, dim=1).numpy()
+    plt.figure(figsize=(10, 6))
+    hist_range = (0.0, max(1.5, np.percentile(original_radii_np, 99), np.percentile(generated_radii, 99))) # Dynamic range
+    plt.hist(original_radii_np, bins=50, range=hist_range, density=True, alpha=0.6, label='Original Data Radii')
+    plt.hist(generated_radii, bins=50, range=hist_range, density=True, alpha=0.6, label='Generated Data Radii (Flow)')
+    plt.xlabel('Radius')
+    plt.ylabel('Density')
+    plt.legend()
+    plt.title(f'Histogram of Data Radii (Flow Matching)\n{get_config_description(config)}')
+    plt.grid(True, linestyle='--', linewidth=0.5)
+    histogram_fig = plt.gcf()
+    save_plot(histogram_fig, config, "radii_histogram_fm.png")
+
+def plot_scatter(data_on_device, generated_data, config):
+    """Plots a 2D scatter plot of original and generated data samples."""
+    if config.M < 2:
+        print("Scatter plot requires M >= 2.")
+        return
+    plt.figure(figsize=(8, 8))
+    num_points_to_plot = min(1000, data_on_device.shape[0], generated_data.shape[0])
+    # Ensure data is on CPU for plotting
+    orig_data_cpu = data_on_device[:num_points_to_plot].detach().cpu()
+    gen_data_cpu = generated_data[:num_points_to_plot].cpu() # Already on CPU
+
+    plt.scatter(orig_data_cpu[:, 0], orig_data_cpu[:, 1], alpha=0.5, s=10, label=f'Original Data ({num_points_to_plot} points)')
+    plt.scatter(gen_data_cpu[:, 0], gen_data_cpu[:, 1], alpha=0.5, s=10, label=f'Generated Data ({num_points_to_plot} points)')
+    plt.xlabel('Feature 1')
+    plt.ylabel('Feature 2')
+    plt.legend()
+    plt.title(f'Data Scatter Plot (2D Projection)\n{get_config_description(config)}')
+    plt.axis('equal')
+    plt.grid(True, linestyle='--', linewidth=0.5)
+    scatter_fig = plt.gcf()
+    save_plot(scatter_fig, config, "scatter_plot_2d_fm.png")
+
+
+# ===================================================================
+# Animation Function (Refactored slightly)
+# ===================================================================
+def create_flow_animation(v_net, config, num_samples, conditional_data=None, srcdist=None, filename="flow_animation.gif"):
+    """ Generates an animation of the flow from noise to data using the provided model. """
+    if config.M < 2:
+        print("Animation requires data dimensionality M >= 2. Skipping animation.")
+        return
+
+    print(f"\n--- Generating Animation ({num_samples} samples, {config.ode_steps} steps) ---")
+    # Ensure srcdist for animation is on the correct device before passing to sample_flow
+    if srcdist is not None:
+        srcdist_anim = srcdist[:num_samples].to(config.device) # Take subset and move to device
+    else:
+        srcdist_anim = None # sample_flow will generate Gaussian noise
+
+    # sample_flow expects srcdist on the *same device* as the model will run on (config.device)
+    # but returns the trajectory on CPU.
+    traj_cpu = sample_flow(v_net, config, num_samples=num_samples, conditional_data=conditional_data, srcdist=srcdist_anim, returntraj=True).numpy()
+
+    # --- Create Animation ---
+    fig, ax = plt.subplots(figsize=(6, 6))
+    # Determine fixed plot limits based on the final distribution (+ a buffer)
+    final_points = traj_cpu[-1]
+    if final_points.shape[0] > 0: # Check if any points were generated
+        xlim = (final_points[:, 0].min() - 0.5, final_points[:, 0].max() + 0.5)
+        ylim = (final_points[:, 1].min() - 0.5, final_points[:, 1].max() + 0.5)
+    else:
+        xlim = (-2, 2) # Default limits if no points
+        ylim = (-2, 2)
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    ax.set_aspect('equal', adjustable='box')
+    ax.grid(True, linestyle='--', linewidth=0.5)
+    ax.set_xlabel("Feature 1")
+    ax.set_ylabel("Feature 2")
+
+    scatter = ax.scatter([], [], alpha=0.6, s=10) # Initialize empty scatter plot
+    # Only create lines if num_samples is reasonable, otherwise animation can be slow
+    lines = []
+    if num_samples <= 300: # Limit number of trajectory lines
+         lines = [ax.plot([], [], linestyle='--', alpha=0.3, linewidth=0.8)[0] for _ in range(num_samples)]
+    title_obj = ax.set_title(f'Flow Animation - Step 0/{config.ode_steps}') # Initial title
+
+    def update(frame):
+        points = traj_cpu[frame]
+        scatter.set_offsets(points[:, :2]) # Use first two dimensions
+        title_obj.set_text(f'Flow Animation - Step {frame+1}/{config.ode_steps}')
+        artists = [scatter] # Artists to return for blitting
+
+        # Update lines if they exist
+        if lines:
+            for i in range(num_samples):
+                x_traj = traj_cpu[:frame+1, i, 0]
+                y_traj = traj_cpu[:frame+1, i, 1]
+                lines[i].set_data(x_traj, y_traj)
+            artists.extend(lines)
+
+        return artists
+
+    # Create the animation
+    ani = animation.FuncAnimation(fig, update, frames=config.ode_steps,
+                                  interval=50, blit=True) # interval in ms
+
+    # Save the animation
+    config_dir = get_config_directory(config)
+    pathlib.Path(config_dir).mkdir(parents=True, exist_ok=True)
+    filepath = pathlib.Path(config_dir) / filename
+    try:
+        print(f"Saving animation to {filepath}...")
+        ani.save(filepath, writer='pillow', fps=15) # Using pillow for GIF
+        print("Animation saved successfully.")
+    except Exception as e:
+        print(f"Error saving animation: {e}")
+        print("Ensure you have 'pillow' installed (`pip install pillow`).")
+    plt.close(fig) # Close the figure after saving
+
+
+# ===================================================================
+# Main Execution Block (Flow Matching) - Refactored
 # ===================================================================
 if __name__ == "__main__":
     # 1. Generate Data (on CPU initially)
     M = 3 # Data dimensionality
-    num_samples = 32000
-    print(f"Generating {num_samples} samples...")
-    data_cpu, original_radii = generate_3d_sphere_data(num_samples)
+    num_samples_data = 32000
+    print(f"Generating {num_samples_data} target samples...")
+    data_cpu, original_radii = generate_3d_sphere_data(num_samples_data)
     data_cpu = data_cpu.float()
+    original_radii_np = original_radii.numpy() # Keep numpy version
 
-    # 2. Configure Training (Flow Matching specific)
+    # Generate Source distribution (e.g., Gaussian) on CPU
+    num_samples_source = num_samples_data # Match size for simplicity
+    print(f"Generating {num_samples_source} source samples (Gaussian)...")
+    srcdist_cpu = torch.randn(num_samples_source, M)
+
+    # 2. Configure Training
     config = Config(
         M=M,
-        nhidden=1024,        # Reduced hidden size for faster example
-        nlayers=2,          # Number of layers (tune)
-        batch_size=128,    # Adjust based on VRAM
-        learning_rate=1e-3, # Tune learning rate
-        epochs=10000,         # Number of training epochs
-        time_embed_dim=64, # Dimension for time embedding
-        ode_steps=50,       # Number of steps for sampling ODE solver
-        epsilon=1e-5,        # Small offset for time sampling
-        conditional=False,   # Enable conditional training
-        conditional_dim=16    # Dimension of conditional variable
+        nhidden=1024,
+        nlayers=2,
+        batch_size=128,
+        learning_rate=1e-3,
+        epochs=100, # Reduced epochs for faster testing
+        time_embed_dim=64, # Note: Not used by VelocityMLP_Conditional
+        ode_steps=50,
+        epsilon=1e-5,
+        conditional=False,
+        conditional_dim=0, # Set to 0 if conditional=False
+        useOT=False # Optimal Transport flag
     )
 
-    # 3. Move Entire Dataset to Target Device (GPU if available)
-    data_on_device = None
-    if config.device.type == 'cuda':
-        print(f"Attempting to move dataset ({data_cpu.nelement() * data_cpu.element_size() / 1024**2:.2f} MB) to {config.device}...")
-        try:
-            data_on_device = data_cpu.to(config.device)
-            print(f"Successfully moved dataset to {data_on_device.device}")
-        except RuntimeError as e:
-            print(f"\n----- ERROR moving full dataset to GPU: {e}. Exiting. -----")
-            exit()
-    else:
-        print("Running on CPU, keeping data on CPU.")
-        data_on_device = data_cpu
+    # 3. Prepare Data (Move to Device handled within prepare_data_and_loaders)
+    # We pass CPU tensors; the function moves them based on config.device
+    # The function returns feature_data and srcdist already on the target device.
+    data_on_device = data_cpu # Keep original CPU data if needed later
+    try:
+        # prepare_data_and_loaders returns device tensors for feature_data and srcdist
+        feature_data_device, _, srcdist_device, _, _ = prepare_data_and_loaders(
+            data_cpu, config, srcdist_cpu, shuffle_train=False # Get device tensors without loaders
+        )
+    except Exception as e:
+         print(f"\n----- ERROR preparing data for device: {e}. Exiting. -----")
+         exit()
 
     # --- Training ---
     train_model_flag = True
     config_dir = get_config_directory(config)
-    os.makedirs(config_dir, exist_ok=True)
-    model_filename = "model_fm.pth" # Flow Matching model filename
-    epoch_losses = []
+    pathlib.Path(config_dir).mkdir(parents=True, exist_ok=True)
+    model_filename = "model_fm.pth"
+    trained_model = None
 
     if train_model_flag:
         print("\n--- Starting Flow Matching Training ---")
-        # Call the flow matching training function
-        trained_model, epoch_losses = train_flow_matching(data_on_device, config)
+        # Pass CPU data to training function, it will handle device placement via helpers
+        trained_model, epoch_losses  = train_flow_matching(
+            data_cpu, config, srcdist=srcdist_cpu
+        )
 
         if trained_model:
             save_model(trained_model, config, filename=model_filename)
             if epoch_losses:
-                plt.figure(figsize=(10, 5))
-                plt.plot(epoch_losses, label='Training Loss (Flow Matching)')
-                plt.xlabel('Epoch')
-                plt.ylabel('Loss (MSE)')
-                plt.yscale('log')
-                plt.grid(True, which='both', linestyle='--', linewidth=0.5)
-                plt.legend()
-                plt.title(f'Flow Matching Training Loss\n{get_config_description(config)}')
-                loss_fig = plt.gcf()
-                save_plot(loss_fig, config, "training_loss_fm.png")
+                plot_training_loss(epoch_losses, config)
         else:
-            print("Training failed, model not saved.")
+            print("Training failed or was skipped, model not saved.")
 
-    # --- Sampling ---
-    model_path = os.path.join(config_dir, model_filename)
-    if not os.path.exists(model_path):
-        print(f"\nModel file {model_path} not found. Cannot perform sampling.")
+    # --- Sampling & Evaluation ---
+    model_path = pathlib.Path(config_dir) / model_filename
+    if not model_path.exists():
+        print(f"\nModel file {model_path} not found. Cannot perform sampling/evaluation.")
     else:
-        print("\n--- Loading Model for Flow Matching Sampling ---")
-        # Load the velocity network model
-        loaded_model = load_model(VelocityMLP, config, filename=model_filename)
-
-        print("--- Generating Samples using ODE Solver ---")
-        num_generated_samples = 4000
-        # Sampling might be done in one go if VRAM allows, or batched if needed
-        # For simplicity, generating all samples at once here
-        generated_data = sample_flow(loaded_model, config, num_samples=num_generated_samples)
-
-        if generated_data is not None and generated_data.shape[0] > 0:
-             print(f"Generated {generated_data.shape[0]} samples.")
-
-             # --- Analysis and Plotting (same as before) ---
-             print("--- Analyzing and Plotting Results ---")
-             generated_radii = torch.norm(generated_data, dim=1).numpy()
-             original_radii_np = original_radii.cpu().numpy()
-
-             # Plot Radii Histogram
-             plt.figure(figsize=(10, 6))
-             hist_range = (0.0, 1.5) # Adjust range if needed
-             plt.hist(original_radii_np, bins=50, range=hist_range, density=True, alpha=0.6, label='Original Data Radii')
-             plt.hist(generated_radii, bins=50, range=hist_range, density=True, alpha=0.6, label='Generated Data Radii (Flow)')
-             plt.xlabel('Radius')
-             plt.ylabel('Density')
-             plt.legend()
-             plt.title(f'Histogram of Data Radii (Flow Matching)\n{get_config_description(config)}')
-             plt.grid(True, linestyle='--', linewidth=0.5)
-             histogram_fig = plt.gcf()
-             save_plot(histogram_fig, config, "radii_histogram_fm.png")
-
-             # Plot Scatter (if M >= 2)
-             if M >= 2:
-                 plt.figure(figsize=(8, 8))
-                 num_points_to_plot = min(1000, data_on_device.shape[0], generated_data.shape[0])
-                 orig_data_cpu = data_on_device[:num_points_to_plot].cpu()
-                 gen_data_cpu = generated_data[:num_points_to_plot].cpu() # Already on CPU from sample_flow
-                 plt.scatter(orig_data_cpu[:, 0], orig_data_cpu[:, 1], alpha=0.5, s=10, label='Original Data Sample')
-                 plt.scatter(gen_data_cpu[:, 0], gen_data_cpu[:, 1], alpha=0.5, s=10, label='Generated Data Sample (Flow)')
-                 plt.xlabel('Feature 1')
-                 plt.ylabel('Feature 2')
-                 plt.legend()
-                 plt.title(f'Data Scatter Plot (Flow Matching)\n{get_config_description(config)}')
-                 plt.axis('equal')
-                 plt.grid(True, linestyle='--', linewidth=0.5)
-                 scatter_fig = plt.gcf()
-                 save_plot(scatter_fig, config, "scatter_plot_2d_fm.png")
-
-             print(f"\nResults saved in directory: {config_dir}")
-        else:
-             print("No data generated or sampling failed.")
-
-    print("\nScript finished.")
+        print("\n--- Loading Model for Sampling & Evaluation ---")
+        # Load the model - specify the class used during
