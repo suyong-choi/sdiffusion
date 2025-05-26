@@ -48,11 +48,10 @@ def get_map(x0, x1):
 # ===================================================================
 class Config:
     """ Stores model and training configuration parameters for Flow Matching. """
-    def __init__(self, M, nhidden, nlayers, batch_size, learning_rate, epochs, time_embed_dim=64, ode_steps=50, epsilon=1e-5, conditional=False, conditional_dim=0, useOT=False):
+    def __init__(self, M, nhidden, nlayers, batch_size, learning_rate, epochs, time_embed_dim=64, ode_steps=50, epsilon=1e-5, conditional=False, conditional_dim=0, useOT=False, useAMP=False, fourier_features=0, fourier_max_freq=10.0):
         self.M = M # Data dimensionality
         self.nhidden = nhidden # Hidden layer size
         self.nlayers = nlayers # Number of layers in MLP
-        # Removed: timesteps, noise_schedule
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.epochs = epochs
@@ -62,10 +61,10 @@ class Config:
         self.conditional = conditional # Flag for conditional training
         self.conditional_dim = conditional_dim # Dimension of conditional variable
         self.useOT = useOT # Flag for using optimal transport plan
-
-        # --- Device and AMP setup ---
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.use_amp = torch.cuda.is_available()
+        self.use_amp = torch.cuda.is_available() and useAMP # Use AMP if CUDA is available and requested
+        self.fourier_features = fourier_features # Number of Fourier features for Mingrustack
+        self.fourier_max_freq = fourier_max_freq # Maximum frequency for Fourier features
         print(f"Using device: {self.device}")
         print(f"Automatic Mixed Precision (AMP) enabled: {self.use_amp}")
         if not torch.cuda.is_available():
@@ -137,7 +136,7 @@ class VelocityMLP(nn.Module):
         return velocity
 
 class VelocityMLP_Conditional(nn.Module):
-    def __init__(self, M, nhidden, nlayers, conditional=False, conditional_dim=0):
+    def __init__(self, M, nhidden, nlayers, conditional=False, conditional_dim=0, fourier_features=0, fourier_max_freq=10.0):
         super().__init__()
         self.M = M
         self.nhidden = nhidden
@@ -147,7 +146,11 @@ class VelocityMLP_Conditional(nn.Module):
         core_input_dim = M + 1 # M + 1 for time embedding (t)
         if conditional:
             core_input_dim += conditional_dim
-        self.core_model = Mingrustack(nlayers, core_input_dim, nhidden, M) # Output dim is M (velocity)
+        self.core_model = Mingrustack(
+            nlayers, core_input_dim, nhidden, M, dropout=0.0,
+            fourier_features=fourier_features, fourier_max_freq=fourier_max_freq, layernorm=True
+        ) # Output dim is M (velocity)
+        #self.core_model = DynamicMLP(core_input_dim, nhidden, nlayers, M) # Output dim is M (velocity)
     
     def forward(self, x, t, c=None):
         # x shape: [batch_size, M]
@@ -168,14 +171,15 @@ class VelocityMLP_Conditional(nn.Module):
 # ===================================================================
 # Utility Functions (Keep as before: model_io.py, plotting_utils.py)
 # ===================================================================
-def get_config_directory(config):
+def get_config_directory(config:Config):
     """ Creates a directory name based on config parameters. """
     lr_str = f"{config.learning_rate:.0e}" # Format LR concisely
     # Adjusted for Flow Matching config
+    fourier_str = f"_FF{config.fourier_features}_FMF{config.fourier_max_freq}" if getattr(config, 'fourier_features', 0) > 0 else ""
     if config.useOT:
-        return f"FM_M{config.M}_nh{config.nhidden}_nl{config.nlayers}_ted{config.time_embed_dim}_BS{config.batch_size}_LR{lr_str}_E{config.epochs}_OT"
+        return f"FM_M{config.M}_nh{config.nhidden}_nl{config.nlayers}_st{config.ode_steps}_BS{config.batch_size}_LR{lr_str}_E{config.epochs}_AMP{config.use_amp}{fourier_str}_OT"
     else:
-        return f"FM_M{config.M}_nh{config.nhidden}_nl{config.nlayers}_ted{config.time_embed_dim}_BS{config.batch_size}_LR{lr_str}_E{config.epochs}"
+        return f"FM_M{config.M}_nh{config.nhidden}_nl{config.nlayers}_st{config.ode_steps}_BS{config.batch_size}_LR{lr_str}_E{config.epochs}_AMP{config.use_amp}{fourier_str}"
 
 def save_model(model, config, filename="model_fm.pth"): # Changed default filename
     """ Saves the model state dictionary. """
@@ -287,8 +291,8 @@ def sample_flow(v_net, config, num_samples=1, conditional_data=None, srcdist=Non
             x0,
             t_eval,
             method='dopri5', # Or 'rk4', 'euler', etc.
-            atol=1e-5, # Absolute tolerance
-            rtol=1e-5  # Relative tolerance
+            atol=1e-4, # Absolute tolerance
+            rtol=1e-4  # Relative tolerance
         )
         print("ODE integration finished.")
 
@@ -410,6 +414,7 @@ def train_flow_matching(data, config, srcdist=None, v_net=None, shuffle_train=Tr
         return None, []
 
     epoch_losses = []
+    epoch_grad_norms = []
 
     print(f"--- Starting Flow Matching Training ({config.epochs} epochs) ---")
     epochs_pbar = tqdm(range(config.epochs), desc=f"Training FM", unit="epoch")
@@ -418,6 +423,7 @@ def train_flow_matching(data, config, srcdist=None, v_net=None, shuffle_train=Tr
     for epoch in epochs_pbar:
         v_net.train()
         epoch_loss = 0.0
+        epoch_grad_norm = 0.0
         num_batches = 0
 
         # Use zip_longest if datasets might have slightly different sizes due to drop_last
@@ -430,58 +436,68 @@ def train_flow_matching(data, config, srcdist=None, v_net=None, shuffle_train=Tr
 
         # Using zip assumes dataloaders yield same number of batches (due to drop_last=True)
         for batch, srcbatch_tuple in zip(dataloader, srcdataloader):
-            x_1 = batch[0]
+            x_1 = batch[0] # Target data points (feature data only)
             x_0 = srcbatch_tuple[0] # DataLoader wraps tensors in a tuple
+            # 2.5 Use conditional variable from data
             c = batch[1] if config.conditional else None
             current_batch_size = x_1.shape[0]
 
+            # 1. Sample time t ~ U(epsilon, 1)
             t = torch.rand(current_batch_size, device=device) * (1.0 - epsilon) + epsilon
 
+            # 2.5.5 Sample optimal transport plan (x_0, x_1) 
             if config.useOT:
-                # Ensure x_0 and x_1 are used for OT mapping before potential modification
-                x_0_ot = x_0
-                x_1_ot = x_1
-                ot_plan = get_map(x_0_ot, x_1_ot)
-                # Sample indices based on the OT plan. This part needs careful implementation.
-                # A simple approach (might not be strictly correct OT sampling):
-                # Find pairs with non-zero transport mass. For simplicity, we might
-                # just use the original pairs if OT plan is complex to sample from directly.
-                # Or, use pot.sample.sample_from_plan(ot_plan) if applicable.
-                # Sticking to the original pairing for simplicity here unless a specific
-                # OT sampling strategy is required. If OT is used, the pairing
-                # x_0[i] -> x_1[j] is determined by the plan P[i,j].
-                # The provided code `indices = np.nonzero(M)[1]` seemed incorrect for sampling pairs.
-                # Let's skip the complex OT sampling for now and use direct pairs.
-                # If true OT path sampling is needed, `get_map` and sampling logic needs revision.
-                pass # Placeholder if OT sampling logic needs refinement
+                M = get_map(x_0, x_1) # Compute the OT plan (cost matrix)
+                indices = np.nonzero(M)[1] # Get non-zero indices for sampling
+                x_0 = x_0[indices] # Sample x_0 based on the OT plan
 
+            # 3. Calculate points on the OT path: x_t = t*x_1 + (1-t)*x_0
+            # Need to reshape t for broadcasting: [batch_size, 1]
             t_reshaped = t.view(-1, 1)
             x_t = t_reshaped * x_1 + (1.0 - t_reshaped) * x_0
+            # 4. Calculate target velocity: v_target = x_1 - x_0
             v_target = x_1 - x_0
 
             with amp.autocast(enabled=config.use_amp):
+                # Predict velocity using the network
                 predicted_velocity = v_net(x_t, t, c=c)
+                # Calculate loss between predicted and target velocity
                 loss = criterion(predicted_velocity, v_target)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
+            # --- Gradient Norm Monitoring ---
+            if config.use_amp:
+                scaler.unscale_(optimizer)
+            total_norm = 0.0
+            for p in v_net.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+            # Optionally clip gradients
+            torch.nn.utils.clip_grad_norm_(v_net.parameters(), max_norm=1.0, error_if_nonfinite=True)
             scaler.step(optimizer)
             scaler.update()
 
             epoch_loss += loss.item()
+            epoch_grad_norm += total_norm
             num_batches += 1
 
         if num_batches > 0:
             avg_epoch_loss = epoch_loss / num_batches
+            avg_epoch_grad_norm = epoch_grad_norm / num_batches
             epoch_losses.append(avg_epoch_loss)
-            epochs_pbar.set_postfix(avg_loss=f"{avg_epoch_loss:.6f}")
+            epoch_grad_norms.append(avg_epoch_grad_norm)
+            epochs_pbar.set_postfix(avg_loss=f"{avg_epoch_loss:.6f}", avg_grad_norm=f"{avg_epoch_grad_norm:.4f}")
         else:
             print(f"Warning: No batches processed in epoch {epoch+1}.")
             epoch_losses.append(float("nan"))
+            epoch_grad_norms.append(float("nan"))
 
 
     print("\nTraining finished.")
-    return v_net, epoch_losses
+    return v_net, epoch_losses, epoch_grad_norms
 
 
 # ===================================================================
@@ -500,6 +516,19 @@ def plot_training_loss(epoch_losses, config, training_plotfilename="training_los
     plt.title(f'Flow Matching Training Loss\n{get_config_description(config)}')
     loss_fig = plt.gcf()
     save_plot(loss_fig, config, training_plotfilename)
+
+def plot_grad_norms(epoch_grad_norms, config, gradnorm_plotfilename="training_gradnorm_fm.png"):
+    """Plots the average gradient norm per epoch."""
+    plt.figure(figsize=(10, 5))
+    plt.plot(epoch_grad_norms, label='Avg Gradient Norm (Flow Matching)')
+    plt.xlabel('Epoch')
+    plt.ylabel('Gradient Norm (L2)')
+    plt.yscale('log')
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.legend()
+    plt.title(f'Flow Matching Training Gradient Norm\n{get_config_description(config)}')
+    gradnorm_fig = plt.gcf()
+    save_plot(gradnorm_fig, config, gradnorm_plotfilename)
 
 def plot_radii_histogram(original_radii_np, generated_data, config):
     """Plots histograms of original and generated data radii."""
@@ -673,7 +702,7 @@ if __name__ == "__main__":
     if train_model_flag:
         print("\n--- Starting Flow Matching Training ---")
         # Pass CPU data to training function, it will handle device placement via helpers
-        trained_model, epoch_losses  = train_flow_matching(
+        trained_model, epoch_losses, epoch_grad_norms  = train_flow_matching(
             data_cpu, config, srcdist=srcdist_cpu
         )
 
@@ -681,6 +710,7 @@ if __name__ == "__main__":
             save_model(trained_model, config, filename=model_filename)
             if epoch_losses:
                 plot_training_loss(epoch_losses, config)
+                plot_grad_norms(epoch_grad_norms, config) # Plot gradient norms
         else:
             print("Training failed or was skipped, model not saved.")
 
@@ -690,4 +720,55 @@ if __name__ == "__main__":
         print(f"\nModel file {model_path} not found. Cannot perform sampling/evaluation.")
     else:
         print("\n--- Loading Model for Sampling & Evaluation ---")
-        # Load the model - specify the class used during
+        # Load the model - specify the class used during training
+        trained_model = load_model(VelocityMLP_Conditional, config, filename=model_filename)
+
+        # 1. Generate Samples (Forward ODE Integration)
+        num_samples_generate = 5000
+        print(f"\n--- Generating {num_samples_generate} samples ---")
+        with torch.no_grad():
+            generated_samples = sample_flow(
+                trained_model,
+                config,
+                num_samples=num_samples_generate,
+                srcdist=srcdist_cpu[:num_samples_generate], # Use CPU srcdist for consistency
+                returnsrc=True, # Return both source and generated samples
+                returntraj=False # No need for trajectory in this context
+            )
+
+        # --- Save Generated Samples to File ---
+        try:
+            np.savetxt(config_dir / "generated_samples_fm.txt", generated_samples.numpy(), delimiter=",")
+            print(f"Generated samples saved to {config_dir / 'generated_samples_fm.txt'}")
+        except Exception as e:
+            print(f"Error saving generated samples: {e}")
+
+        # 2. Evaluate Quality of Generated Samples
+        print("\n--- Evaluating Generated Samples ---")
+        try:
+            # Load original data for comparison
+            original_data = data_cpu.numpy() # Ensure original data is on CPU and in numpy format
+            # Use the first num_samples_generate points for a fair comparison
+            original_data_subset = original_data[:num_samples_generate]
+
+            # Compute Wasserstein distance (Earth Mover's Distance) between original and generated samples
+            wasserstein_distance = np.mean([
+                np.min(get_map(torch.tensor(orig_point), torch.tensor(generated_samples))) # OT cost for each original point
+                for orig_point in tqdm(original_data_subset, desc="Computing Wasserstein Distance", leave=False)
+            ])
+
+            print(f"Average Wasserstein Distance (EMD) between original and generated samples: {wasserstein_distance:.6f}")
+        except Exception as e:
+            print(f"Error during evaluation: {e}")
+
+        # 3. Visualization of Generated Samples (Optional)
+        # Here you can add code to visualize the generated samples, e.g., scatter plots, histograms, etc.
+        # For high-dimensional data, consider plotting pairwise 2D projections or using dimensionality reduction techniques.
+
+        # Example: 2D scatter plot of the first two dimensions
+        try:
+            plot_scatter(data_on_device, generated_samples, config)
+        except Exception as e:
+            print(f"Error during visualization: {e}")
+
+    print("\n--- Flow Matching Pipeline Completed ---")

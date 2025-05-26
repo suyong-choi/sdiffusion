@@ -27,7 +27,7 @@ class DynamicMLP(nn.Module):
         layers = []
         layers.append(nn.Linear(input_dim, hidden_dim))
         layers.append(activation())
-        for _ in range(num_layers - 1):
+        for _ in range(num_layers ):
             layers.append(nn.Linear(hidden_dim, hidden_dim))
             layers.append(activation())
         layers.append(nn.Linear(hidden_dim, output_dim))
