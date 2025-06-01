@@ -10,3 +10,7 @@ matching is implemented.
 - pandas
 - numpy
 - matplotlib
+- pot
+- tqdm
+- ipympl
+- jupyter
