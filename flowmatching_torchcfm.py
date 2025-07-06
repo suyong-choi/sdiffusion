@@ -14,7 +14,7 @@ import torch.cuda.amp as amp
 import torch.nn.functional as F # For F.pad
 from torchdiffeq import odeint # Import the ODE solver
 from mingruinspired import Mingrustack, MLPStack  # Assuming this is your custom module
-from utils import generate_3d_sphere_data, DynamicMLP
+
 import ot as pot
 import numpy as np
 import random # Import random for selecting dataloaders
@@ -23,39 +23,13 @@ import itertools # Import itertools for infinite iterators
 # Import torchcfm components
 from torchcfm.conditional_flow_matching import ConditionalFlowMatcher, ExactOptimalTransportConditionalFlowMatcher
 
-# ===================================================================
-# Evaluation Metrics
-# ===================================================================
-
-def get_map(x0, x1):
-    """Compute the OT plan (wrt squared Euclidean cost) between a source and a target
-    minibatch.
-
-    Parameters
-    ----------
-    x0 : Tensor, shape (bs, *dim)
-        represents the source minibatch
-    x1 : Tensor, shape (bs, *dim)
-        represents the source minibatch
-
-    Returns
-    -------
-    p : numpy array, shape (bs, bs)
-        represents the OT plan between minibatches
-    """
-    a, b = pot.unif(x0.shape[0]), pot.unif(x1.shape[0])
-    M = torch.cdist(x0, x1) ** 2
-    # Ensure M is on CPU and is a float64 numpy array for POT
-    M_np = M.detach().cpu().double().numpy()
-    p = pot.emd(a, b, M_np)
-    return p
 
 # ===================================================================
 # Configuration Class (Adapted for Flow Matching)
 # ===================================================================
 class Config:
     """ Stores model and training configuration parameters for Flow Matching. """
-    def __init__(self, M, nhidden, nlayers, batch_size, learning_rate, epochs, time_embed_dim=64, ode_steps=50, epsilon=1e-5, conditional=False, conditional_dim=0, conditional_bkg=[], useOT=False, useAMP=False, fourier_features=0, fourier_max_freq=10.0):
+    def __init__(self, M, nhidden, nlayers, batch_size, learning_rate, epochs, time_embed_dim=64, ode_steps=50, epsilon=1e-5, conditional=False, conditional_dim=0, conditional_bkg=[], useOT=False, useAMP=False, fourier_features=0, fourier_max_freq=10.0, use_layernorm=True, use_mingrustack=False):
         self.M = M # Data dimensionality
         self.nhidden = nhidden # Hidden layer size
         self.nlayers = nlayers # Number of layers in MLP
@@ -75,6 +49,8 @@ class Config:
         self.use_amp = torch.cuda.is_available() and useAMP # Use AMP if CUDA is available and requested
         self.fourier_features = fourier_features # Number of Fourier features for Mingrustack
         self.fourier_max_freq = fourier_max_freq # Maximum frequency for Fourier features
+        self.use_layernorm = use_layernorm # Flag for using LayerNorm in the model
+        self.use_mingrustack = use_mingrustack # Flag for using Mingrustack (if False, use MLPStack)
         print(f"Using device: {self.device}")
         print(f"Automatic Mixed Precision (AMP) enabled: {self.use_amp}")
         if not torch.cuda.is_available():
@@ -88,20 +64,26 @@ class Config:
 
 # New wrapper class for Mingrustack to work with torchcfm
 class VelocityField(nn.Module):
-    def __init__(self, M, nhidden, nlayers, conditional=False, conditional_dim=0, fourier_features=0, fourier_max_freq=10.0):
+    def __init__(self, M, nhidden, nlayers, conditional=False, conditional_dim=0, fourier_features=0, fourier_max_freq=10.0, use_layernorm=True, use_mingrustack=False):
         super().__init__()
         self.M = M
         self.conditional = conditional
         self.conditional_dim = conditional_dim
-        # Input to Mingrustack will be concatenation of x_t, t, and c (if conditional)
         core_input_dim = M + 1 # M + 1 for time (t)
         if conditional:
             core_input_dim += conditional_dim
-
-        self.core_model = Mingrustack(
-            nlayers, core_input_dim, nhidden, M, dropout=0.0,
-            fourier_features=fourier_features, fourier_max_freq=fourier_max_freq, layernorm=True
-        ) # Output dim is M (velocity)
+        # Choose architecture based on config
+        if use_mingrustack:
+            self.core_model = Mingrustack(
+                nlayers, core_input_dim, nhidden, M, dropout=0.0,
+                fourier_features=fourier_features, fourier_max_freq=fourier_max_freq, layernorm=use_layernorm
+            )
+        else:
+            self.core_model = MLPStack(
+                nlayers, core_input_dim, nhidden, M, dropout=0.0,
+                fourier_features=fourier_features, fourier_max_freq=fourier_max_freq, layernorm=use_layernorm
+            )
+        pass
 
     def forward(self, t, x, c=None):
         # x shape: [batch_size, M] (this is x_t from CFM)
@@ -110,7 +92,7 @@ class VelocityField(nn.Module):
 
         # Ensure t is a batch tensor for concatenation
         if t.dim() == 0:
-             t_reshaped = t.full((x.shape[0],), t.item(), device=x.device, dtype=x.dtype).view(-1, 1)
+             t_reshaped = torch.full((x.shape[0],), t.item(), device=x.device, dtype=x.dtype).view(-1, 1)
         else:
              t_reshaped = t.view(-1, 1)
 
@@ -133,12 +115,14 @@ class VelocityField(nn.Module):
 def get_config_directory(config:Config):
     """ Creates a directory name based on config parameters. """
     lr_str = f"{config.learning_rate:.0e}" # Format LR concisely
-    # Adjusted for Flow Matching config
     fourier_str = f"_FF{config.fourier_features}_FMF{config.fourier_max_freq}" if getattr(config, 'fourier_features', 0) > 0 else ""
+    # Add layernorm and architecture flags to directory name
+    layernorm_str = "_layernorm" if getattr(config, 'use_layernorm', False) else "_nolayernorm"
+    arch_str = "_mingrustack" if getattr(config, 'use_mingrustack', False) else "_mlp"
     if config.useOT:
-        return f"FM_M{config.M}_nh{config.nhidden}_nl{config.nlayers}_st{config.ode_steps}_BS{config.batch_size}_LR{lr_str}_E{config.epochs}_AMP{config.use_amp}{fourier_str}_OT"
+        return f"FM_M{config.M}_nh{config.nhidden}_nl{config.nlayers}_st{config.ode_steps}_BS{config.batch_size}_LR{lr_str}_E{config.epochs}_AMP{config.use_amp}{fourier_str}_OT{layernorm_str}{arch_str}"
     else:
-        return f"FM_M{config.M}_nh{config.nhidden}_nl{config.nlayers}_st{config.ode_steps}_BS{config.batch_size}_LR{lr_str}_E{config.epochs}_AMP{config.use_amp}{fourier_str}"
+        return f"FM_M{config.M}_nh{config.nhidden}_nl{config.nlayers}_st{config.ode_steps}_BS{config.batch_size}_LR{lr_str}_E{config.epochs}_AMP{config.use_amp}{fourier_str}{layernorm_str}{arch_str}"
 
 def save_model(model, config, filename="model_fm.pth"): # Changed default filename
     """ Saves the model state dictionary. """
@@ -153,8 +137,10 @@ def load_model(model_class, config, filename="model_fm.pth"): # Changed default 
     directory = get_config_directory(config)
     filepath = pathlib.Path(directory) / filename
     # Instantiate model first on the correct device
-    # Use the VelocityField class
-    model = VelocityField(config.M, config.nhidden, config.nlayers, config.conditional, config.conditional_dim, config.fourier_features, config.fourier_max_freq).to(config.device)
+    model = VelocityField(
+        config.M, config.nhidden, config.nlayers, config.conditional, config.conditional_dim,
+        config.fourier_features, config.fourier_max_freq, config.use_layernorm, config.use_mingrustack
+    ).to(config.device)
     if filepath.exists():
         try:
             model.load_state_dict(torch.load(filepath, map_location=config.device))
@@ -381,7 +367,6 @@ def initialize_training_components(config, v_net=None):
     """Initializes the model, optimizer, criterion, and scaler."""
     device = config.device
     if v_net is None:
-        # Initialize the new MingruVelocityField model
         print("Initializing VelocityField model.")
         v_net = VelocityField(
             config.M,
@@ -389,12 +374,14 @@ def initialize_training_components(config, v_net=None):
             config.nlayers,
             config.conditional,
             config.conditional_dim,
-            fourier_features=config.fourier_features, # Pass Fourier features config
-            fourier_max_freq=config.fourier_max_freq # Pass Fourier max freq config
+            fourier_features=config.fourier_features,
+            fourier_max_freq=config.fourier_max_freq,
+            use_layernorm=config.use_layernorm,
+            use_mingrustack=config.use_mingrustack
         ).to(device)
     else:
         print("Using provided v_net model.")
-        v_net = v_net.to(device) # Ensure provided model is on correct device
+        v_net = v_net.to(device)
 
     try:
         optimizer = optim.Adam(v_net.parameters(), lr=config.learning_rate)
